@@ -1,0 +1,149 @@
+const fs = require('fs');
+const zlib = require('zlib');
+const https = require('https');
+
+async function fetchJson(url, timeoutMs = 20000) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, { headers: { 'User-Agent': 'Antiradar-Bot/1.0' }, timeout: timeoutMs }, (res) => {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                return reject(new Error(`HTTP ${res.statusCode}`));
+            }
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    resolve(JSON.parse(data));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        });
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Request timed out'));
+        });
+        req.on('error', reject);
+    });
+}
+
+async function main() {
+    console.log("=== Старт автоматического обновления базы камер РФ ===");
+
+    const gzPath = './cameras_russia_live.json.gz';
+    if (!fs.existsSync(gzPath)) {
+        throw new Error("Файл cameras_russia_live.json.gz не найден в репозитории!");
+    }
+
+    const compressed = fs.readFileSync(gzPath);
+    const rawJson = zlib.gunzipSync(compressed).toString('utf8');
+    const existingCameras = JSON.parse(rawJson);
+
+    console.log(`Текущая база: ${existingCameras.length} камер.`);
+
+    const seen = new Set();
+    let maxId = 0;
+    for (const cam of existingCameras) {
+        const key = `${cam.lat.toFixed(4)}:${cam.lon.toFixed(4)}`;
+        seen.add(key);
+        if (cam.id > maxId && cam.id < 9000000) maxId = cam.id;
+    }
+
+    let addedCount = 0;
+    const overpassEndpoints = [
+        "https://overpass-api.de/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter"
+    ];
+
+    const overpassQuery = encodeURIComponent('[out:json][timeout:25];area["ISO3166-1"="RU"][admin_level=2]->.a;(node["highway"="speed_camera"](area.a););out body;');
+
+    console.log("Опрос открытых реестров дорожных комплексов...");
+    for (const ep of overpassEndpoints) {
+        try {
+            const url = `${ep}?data=${overpassQuery}`;
+            console.log(`Запрос к ${ep}...`);
+            const data = await fetchJson(url, 25000);
+            if (data && data.elements && Array.isArray(data.elements)) {
+                for (const el of data.elements) {
+                    if (el.lat && el.lon) {
+                        const key = `${el.lat.toFixed(4)}:${el.lon.toFixed(4)}`;
+                        if (!seen.has(key)) {
+                            seen.add(key);
+                            maxId++;
+                            const speed = parseInt(el.tags?.maxspeed, 10) || 60;
+                            const dir = parseInt(el.tags?.direction, 10) || 0;
+                            existingCameras.push({
+                                id: maxId,
+                                lat: parseFloat(el.lat.toFixed(6)),
+                                lon: parseFloat(el.lon.toFixed(6)),
+                                type: 1,
+                                dir: dir,
+                                dirType: 1,
+                                angle: 16,
+                                dist: speed >= 80 ? 700 : 500,
+                                revDist: 150,
+                                limit: speed
+                            });
+                            addedCount++;
+                        }
+                    }
+                }
+                console.log(`Успешно получено! Добавлено новых комплексов: ${addedCount}`);
+                break;
+            }
+        } catch (e) {
+            console.log(`Зеркало ${ep} недоступно (${e.message}), пробуем следующее...`);
+        }
+    }
+
+    if (existingCameras.length < 35000) {
+        throw new Error(`Ошибка безопасности: размер базы (${existingCameras.length}) меньше допустимого!`);
+    }
+
+    existingCameras.sort((a, b) => a.id - b.id);
+
+    const newJson = JSON.stringify(existingCameras);
+    const newGz = zlib.gzipSync(Buffer.from(newJson, 'utf8'), { level: 9 });
+    fs.writeFileSync(gzPath, newGz);
+
+    const now = new Date();
+    const mskTime = new Date(now.getTime() + 3 * 3600 * 1000).toISOString().replace('T', ' ').substring(0, 19) + ' MSK';
+
+    const readme = `# 📡 База дорожных камер РФ (для Антирадара)
+
+[![Auto-Update](https://github.com/mff404/antiradar-cameras/actions/workflows/update_cameras.yml/badge.svg)](https://github.com/mff404/antiradar-cameras/actions)
+![Камер в базе](https://img.shields.io/badge/Камер_в_базе-${existingCameras.length}-brightgreen)
+![Статус](https://img.shields.io/badge/Обновление-Каждое_воскресенье_03:00_UTC-blue)
+
+Актуальный реестр камер контроля скорости и комплексов фотовидеофиксации для мобильного приложения **Антирадар РЭБ**.
+
+## 📊 Текущее состояние
+- **Всего комплексов в базе:** **${existingCameras.length}**
+- **Последнее обновление:** **${mskTime}**
+- **Размер архива:** **${(newGz.length / 1024).toFixed(1)} КБ** (в распакованном виде ~${(newJson.length / 1024 / 1024).toFixed(2)} МБ)
+- **Зона покрытия:** Вся территория Российской Федерации (все 89 регионов).
+
+## 🚀 CDN для приложения
+- **Основной канал (Cloudflare CDN):**  
+  \`https://cdn.jsdelivr.net/gh/mff404/antiradar-cameras@main/cameras_russia_live.json.gz\`
+- **Резервный канал:**  
+  \`https://raw.githubusercontent.com/mff404/antiradar-cameras/main/cameras_russia_live.json.gz\`
+`;
+
+    fs.writeFileSync('./README.md', readme, 'utf8');
+
+    const statusObj = {
+        updatedAt: mskTime,
+        totalCameras: existingCameras.length,
+        addedInLastRun: addedCount,
+        archiveSizeKb: Math.round(newGz.length / 1024)
+    };
+    fs.writeFileSync('./status.json', JSON.stringify(statusObj, null, 2), 'utf8');
+
+    console.log(`=== Готово! Итого в базе: ${existingCameras.length} камер. Добавлено: ${addedCount}. Время: ${mskTime} ===`);
+}
+
+main().catch(err => {
+    console.error("Критическая ошибка сборщика:", err);
+    process.exit(1);
+});
